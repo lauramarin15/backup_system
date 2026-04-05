@@ -38,6 +38,7 @@ timespec_diff(const struct timespec *inicio,
  * @param is_src 1 si era el origen, 0 si era el destino
  * @return       código SC_ERR_* correspondiente
  * ───────────────────────────────────────────────────────── */
+
 static int
 handle_open_error(const char *path, int is_src)
 {
@@ -168,32 +169,124 @@ sys_smart_copy(const char *src_path,
         goto cleanup;
     }
  
-    /* ── 4. Iniciar medición de tiempo ──────────────────
-     * Tomamos la "foto" del reloj justo antes del bucle.
-     * CLOCK_MONOTONIC = reloj que nunca retrocede,
+    /* CLOCK_MONOTONIC = reloj que nunca retrocede,
      * aunque el usuario cambie la hora del sistema.
      */
     clock_gettime(CLOCK_MONOTONIC, &t_start);
  
-    /* ── 5. Bucle read/write — viene en el paso 4 ───── */
-    (void)buffer;       /* temporal: evita warning de unused */
-    (void)bytes_read;   /* temporal: evita warning de unused */
+    
+    /*
+     *
+     * El externo itera sobre los chunks del archivo.
+     * El interno maneja short-writes — write() puede
+     * escribir MENOS bytes de los pedidos sin ser error.
+     * Sin el bucle interno, esos bytes se perderían.
+     *
+     * Cada llamada a read() y write() es un CONTEXT SWITCH:
+     * tu programa → kernel → tu programa
+     * ───────────────────────────────────────────────────── */
+    while ((bytes_read = read(src_fd, buffer, PAGE_SIZE)) > 0) {
  
+        /*
+         * read() retornó bytes_read bytes leídos.
+         * Contamos la operación de lectura.
+         */
+        read_ops++;
+ 
+        /*
+         * ptr apunta al inicio del buffer.
+         * remaining es cuánto falta escribir.
+         * Ambos se actualizan en cada iteración del while interno.
+         */
+        char    *ptr       = buffer;
+        ssize_t  remaining = bytes_read;
+ 
+        /* ── Bucle interno: short-write handler ─────────
+         *
+         * Ejemplo de short-write:
+         *   bytes_read = 4096
+         *   write() escribe solo 2000 → n_written = 2000
+         *   ptr += 2000    (avanza el puntero)
+         *   remaining = 2096 (queda esto por escribir)
+         *   write() escribe 2096 → n_written = 2096
+         *   remaining = 0  → sale del while
+         *
+         * Sin este bucle, los 2096 bytes se perderían.
+         * ─────────────────────────────────────────────── */
+        while (remaining > 0) {
+ 
+            ssize_t n_written = write(dst_fd, ptr,
+                                      (size_t)remaining);
+ 
+            if (n_written < 0) {
+ 
+                if (errno == EINTR) {
+                    /*
+                     * EINTR: una señal del sistema operativo
+                     * interrumpió write() a mitad.
+                     * No es un error real — reintentar.
+                     */
+                    continue;
+                }
+ 
+                if (errno == ENOSPC) {
+                    /*
+                     * ENOSPC: el disco está lleno.
+                     * No hay forma de recuperarse — salir.
+                     */
+                    fprintf(stderr,
+                        "[ERROR] Disco lleno escribiendo '%s'\n",
+                        dst_path);
+                    syslog(LOG_ERR,
+                        "Disco lleno: %s", dst_path);
+                    rc = SC_ERR_NOSPC;
+                } else {
+                    fprintf(stderr,
+                        "[ERROR] Error de escritura: %s\n",
+                        strerror(errno));
+                    rc = SC_ERR_WRITE;
+                }
+                goto cleanup;
+            }
+ 
+            /* Avanzar puntero y reducir lo que falta */
+            ptr          += n_written;
+            remaining    -= n_written;
+            bytes_copied += n_written;
+            write_ops++;
+        }
+    }
+ 
+    /*
+     * El while externo termina cuando read() retorna 0 (EOF)
+     * o negativo (error de lectura).
+     * Verificamos cuál fue el caso.
+     */
+    if (bytes_read < 0) {
+        fprintf(stderr,
+            "[ERROR] Error de lectura en '%s': %s\n",
+            src_path, strerror(errno));
+        syslog(LOG_ERR, "Error de lectura: %s", src_path);
+        rc = SC_ERR_READ;
+        goto cleanup;
+    }
+ 
+    /* Llegamos aquí solo si todo salió bien */
+    printf("[OK] sys_smart_copy: %lld bytes copiados\n",
+           (long long)bytes_copied);
+    syslog(LOG_INFO, "Copia exitosa: %lld bytes",
+           (long long)bytes_copied);
+ 
+
     /* Éxito provisional */
     syslog(LOG_INFO, "Archivos abiertos correctamente.");
     printf("[OK] Archivos abiertos: src_fd=%d  dst_fd=%d\n",
            src_fd, dst_fd);
- 
-/* ── CLEANUP — siempre se ejecuta ──────────────────────
- * goto cleanup salta aquí desde cualquier punto.
- * Esto garantiza que SIEMPRE cerramos los descriptores,
+
+/* Esto garantiza que SIEMPRE cerramos los descriptores,
  * aunque haya habido un error a mitad del proceso.
- *
- * Si no cerramos los fds, el kernel los mantiene ocupados
- * hasta que el proceso termine — resource leak.
- *
- * if (fd >= 0) evita llamar close(-1) que daría error.
  */
+
 cleanup:
     clock_gettime(CLOCK_MONOTONIC, &t_end);
  
@@ -212,8 +305,61 @@ cleanup:
         result->read_ops        = read_ops;
         result->write_ops       = write_ops;
         result->elapsed_sec     = timespec_diff(&t_start, &t_end);
-        result->throughput_mbps = 0.0; /* se calcula en paso 4 */
+        result->throughput_mbps = (result->elapsed_sec > 0.0)
+            ? (double)bytes_copied
+              / result->elapsed_sec
+              / (1024.0 * 1024.0)
+            : 0.0;
     }
  
     return rc;
 }
+
+
+/* ─────────────────────────────────────────────────────────
+ * sc_strerror() — convierte código SC_ERR_* a texto
+ *
+ * Igual que strerror() de la libc pero para nuestros
+ * códigos propios. La usa syslog y el benchmark.
+ *
+ * Retorna un puntero a string estático — no necesita
+ * free() porque vive en el segmento de datos del programa.
+ * ───────────────────────────────────────────────────────── */
+const char *
+sc_strerror(int err_code)
+{
+    switch (err_code) {
+        case SC_OK:           return "Exito";
+        case SC_ERR_OPEN_SRC: return "No se pudo abrir el origen";
+        case SC_ERR_OPEN_DST: return "No se pudo crear el destino";
+        case SC_ERR_READ:     return "Error de lectura";
+        case SC_ERR_WRITE:    return "Error de escritura";
+        case SC_ERR_PERM:     return "Permiso denegado";
+        case SC_ERR_NOENT:    return "Archivo no existe";
+        case SC_ERR_NOSPC:    return "Disco lleno";
+        case SC_ERR_STAT:     return "Error al leer metadatos";
+        default:              return "Error desconocido";
+    }
+}
+ 
+/* ─────────────────────────────────────────────────────────
+ * sc_print_result() — imprime resumen de una sc_result_t
+ *
+ * La usa run_backup() en main.c para mostrar los
+ * resultados de ambos métodos en formato de tabla.
+ *
+ * @param label  nombre del método ("sys_smart_copy", etc.)
+ * @param result puntero a la estructura con estadísticas
+ * ───────────────────────────────────────────────────────── */
+void
+sc_print_result(const char *label, const sc_result_t *result)
+{
+    if (!result) return;
+ 
+    printf("  %-28s %8.6f s   %8.2f MB/s   %u ops\n",
+           label,
+           result->elapsed_sec,
+           result->throughput_mbps,
+           result->read_ops + result->write_ops);
+}
+ 

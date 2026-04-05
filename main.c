@@ -117,13 +117,58 @@ stdio_copy(const char *src_path,
         }
         goto cleanup;
     }
+
+    /* fread(buffer, 1, PAGE_SIZE, src_f)
+     *   parámetros: dónde guardar, tamaño elemento,
+     *               cuántos elementos, de qué FILE*
+     *   retorna: cuántos elementos leyó (0 = EOF o error)
+     *
+     * fwrite() retorna cuántos elementos escribió.
+     * Si es distinto de n_read → error.
+     */
+    size_t n_read;
+    while ((n_read = fread(buffer, 1, PAGE_SIZE, src_f)) > 0) {
  
-    /* ── 3. Bucle fread/fwrite */
-    (void)buffer;     /* temporal: evita warning */
-    (void)read_ops;   /* temporal: evita warning */
-    (void)write_ops;  /* temporal: evita warning */
+        read_ops++;
  
-    printf("[OK] stdio: archivos abiertos correctamente\n");
+        size_t n_written = fwrite(buffer, 1, n_read, dst_f);
+ 
+        if (n_written != n_read) {
+            /*
+             * fwrite falló — verificar si el disco está lleno.
+             * errno lo llenó fwrite() internamente.
+             */
+            if (errno == ENOSPC) {
+                fprintf(stderr,
+                    "[ERROR] stdio: disco lleno escribiendo\n");
+                rc = SC_ERR_NOSPC;
+            } else {
+                fprintf(stderr,
+                    "[ERROR] stdio: error de escritura: %s\n",
+                    strerror(errno));
+                rc = SC_ERR_WRITE;
+            }
+            goto cleanup;
+        }
+ 
+        write_ops++;
+        bytes_copied += (off_t)n_written;
+    }
+ 
+    /*
+     * ferror() distingue si el while terminó por:
+     *   EOF normal → feof(src_f) es verdadero → ok
+     *   error real → ferror(src_f) es verdadero → error
+     */
+    if (ferror(src_f)) {
+        fprintf(stderr,
+            "[ERROR] stdio: error de lectura en '%s'\n", src_path);
+        rc = SC_ERR_READ;
+        goto cleanup;
+    }
+ 
+    printf("[OK] stdio_copy: %lld bytes copiados\n",
+           (long long)bytes_copied);
  
 cleanup:
     clock_gettime(CLOCK_MONOTONIC, &t_end);
@@ -140,54 +185,305 @@ cleanup:
         result->elapsed_sec = (double)(t_end.tv_sec - t_start.tv_sec)
                             + (double)(t_end.tv_nsec - t_start.tv_nsec)
                             * 1e-9;
-        result->throughput_mbps = 0.0; /* se calcula en paso 4 */
+        result->throughput_mbps = (result->elapsed_sec > 0.0)
+            ? (double)bytes_copied
+              / result->elapsed_sec
+              / (1024.0 * 1024.0)
+            : 0.0;
     }
  
     return rc;
 }
+
+static int
+generate_file(const char *path, long size)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[ERROR] No se pudo generar '%s': %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+ 
+    char block[PAGE_SIZE];
+    srand(12345); /* semilla fija = mismo archivo siempre */
+ 
+    long written = 0;
+    while (written < size) {
+ 
+        /* Calcular chunk: puede ser menor en el último bloque */
+        long chunk = PAGE_SIZE;
+        if (written + chunk > size)
+            chunk = size - written;
+ 
+        /* Llenar con bytes aleatorios 0-255 */
+        for (long i = 0; i < chunk; i++)
+            block[i] = (char)(rand() & 0xFF);
+ 
+        if ((long)fwrite(block, 1, (size_t)chunk, f) != chunk) {
+            fclose(f);
+            return -1;
+        }
+ 
+        written += chunk;
+    }
+ 
+    fclose(f);
+    return 0;
+}
+
+static void
+print_header(void)
+{
+    printf("\n" );
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║     BENCHMARK: sys_smart_copy vs stdio_copy          ║\n");
+    printf("║     buffer = %d bytes (PAGE_SIZE)                  ║\n",
+           PAGE_SIZE);
+    printf("╚══════════════════════════════════════════════════════╝\n");
+    printf( "\n");
+    printf( "%-6s  %-24s  %-24s  %-10s\n",
+           "Tamaño", "sys_smart_copy", "stdio_copy", "Ganador");
+    printf("  %-6s  %-24s  %-24s  %-10s\n",
+           "──────", "────────────────────────",
+           "────────────────────────", "──────────");
+}
+
+static void
+print_row(const char *label,
+          const sc_result_t *smart,
+          const sc_result_t *stdio_r)
+{
+    int smart_wins = (smart->elapsed_sec <= stdio_r->elapsed_sec);
+ 
+    printf("  %-6s  %8.6fs %8.2f MB/s    "
+           "%8.6fs %8.2f MB/s    %s\n",
+           label,
+           smart->elapsed_sec,
+           smart->throughput_mbps,
+           stdio_r->elapsed_sec,
+           stdio_r->throughput_mbps,
+           smart_wins
+               ?  "syscall ✓" 
+               :  "fread  ✓" );
+}
+ 
+ /* ─────────────────────────────────────────────────────────
+ * run_benchmark() — el benchmark completo
+ *
+ * Para cada tamaño (1KB, 1MB, 1GB):
+ *   1. genera el archivo de prueba
+ *   2. corre sys_smart_copy → mide tiempo
+ *   3. corre stdio_copy     → mide tiempo
+ *   4. imprime fila de la tabla
+ *   5. elimina archivos temporales
+ * ───────────────────────────────────────────────────────── */
+static void
+run_benchmark(void)
+{
+    /* Array de structs con los 3 tamaños a probar */
+    struct {
+        const char *label;
+        long        size;
+    } tests[] = {
+        { "1 KB",  SIZE_1KB },
+        { "1 MB",  SIZE_1MB },
+        { "1 GB",  SIZE_1GB },
+    };
+ 
+    /*
+     * sizeof(tests) / sizeof(tests[0]) = cantidad de elementos.
+     * Si agregas un 4to test no tienes que cambiar este número.
+     */
+    int n = (int)(sizeof(tests) / sizeof(tests[0]));
+ 
+    print_header();
+ 
+    for (int i = 0; i < n; i++) {
+ 
+        /* Paso 1: generar archivo de prueba */
+        printf("  Generando %s...\r", tests[i].label);
+        fflush(stdout);
+ 
+        if (generate_file(TMP_SRC, tests[i].size) != 0) {
+            fprintf(stderr, "Error generando archivo de %s\n",
+                    tests[i].label);
+            continue;
+        }
+ 
+        /* Paso 2: sys_smart_copy */
+        sc_result_t res_smart;
+        memset(&res_smart, 0, sizeof(res_smart));
+        unlink(TMP_SMART); /* eliminar si existe del run anterior */
+        sys_smart_copy(TMP_SRC, TMP_SMART, &res_smart);
+ 
+        /* Paso 3: stdio_copy */
+        sc_result_t res_stdio;
+        memset(&res_stdio, 0, sizeof(res_stdio));
+        unlink(TMP_STDIO);
+        stdio_copy(TMP_SRC, TMP_STDIO, &res_stdio);
+ 
+        /* Paso 4: imprimir fila */
+        print_row(tests[i].label, &res_smart, &res_stdio);
+ 
+        /* Paso 5: limpiar */
+        unlink(TMP_SRC);
+        unlink(TMP_SMART);
+        unlink(TMP_STDIO);
+    }
+ 
+    /* Análisis explicativo */
+    printf("\n" "  Análisis:\n");
+    printf("  1 KB → fread gana: buffer interno libc absorbe el\n");
+    printf("         archivo en 1 solo context switch al kernel.\n");
+    printf("  1 GB → syscall gana: fread hace copia extra en RAM\n");
+    printf("         (disco→buf_libc→tu_buf) en cada iteración.\n\n");
+}
+/* ─────────────────────────────────────────────────────────
+ * run_backup() — modo -b: respalda un archivo real
+ *
+ * Corre ambos métodos sobre el mismo archivo y muestra
+ * una tabla comparativa con los tiempos reales.
+ *
+ * Antes de copiar, verifica que el origen existe con stat().
+ * Si no existe, switch(errno) da el mensaje correcto.
+ * ───────────────────────────────────────────────────────── */
+static void
+run_backup(const char *src, const char *dst)
+{
+    struct stat st;
+ 
+    /* Verificar que el origen existe antes de todo */
+    if (stat(src, &st) != 0) {
+        switch (errno) {
+            case ENOENT:
+                fprintf(stderr,
+                    "[ERROR] El origen no existe: '%s'\n", src);
+                break;
+            case EACCES:
+                fprintf(stderr,
+                    "[ERROR] Sin permisos para acceder: '%s'\n", src);
+                break;
+            default:
+                fprintf(stderr,
+                    "[ERROR] stat() falló en '%s': %s\n",
+                    src, strerror(errno));
+        }
+        exit(EXIT_FAILURE);
+    }
+ 
+    printf("\n--- Respaldando '%s' ---\n\n", src);
+ 
+    /*
+     * Generamos dos destinos con sufijo para no pisar
+     * el archivo original:
+     *   archivo.txt → archivo.txt.smart
+     *   archivo.txt → archivo.txt.stdio
+     */
+    char dst_smart[512], dst_stdio[512];
+    snprintf(dst_smart, sizeof(dst_smart), "%s.smart", dst);
+    snprintf(dst_stdio,  sizeof(dst_stdio),  "%s.stdio",  dst);
+ 
+    /* Ejecutar ambos métodos */
+    sc_result_t res_smart, res_stdio;
+    memset(&res_smart, 0, sizeof(res_smart));
+    memset(&res_stdio,  0, sizeof(res_stdio));
+ 
+    sys_smart_copy(src, dst_smart, &res_smart);
+    stdio_copy(src, dst_stdio, &res_stdio);
+ 
+    /* Mostrar resultados comparativos */
+    printf("\n" "  Resultados:\n");
+    printf("  %-28s %-10s  %-12s  %s\n",
+           "Método", "Tiempo", "Throughput", "Ops");
+    printf("  %-28s %-10s  %-12s  %s\n",
+           "────────────────────────────",
+           "──────────", "────────────", "────");
+ 
+    sc_print_result("sys_smart_copy (syscall)", &res_smart);
+    sc_print_result("stdio_copy     (fread)  ", &res_stdio);
+ 
+    int smart_wins =
+        (res_smart.elapsed_sec <= res_stdio.elapsed_sec);
+ 
+    printf("\n  "  "Ganador: %s"  "\n\n",
+           smart_wins ? "sys_smart_copy" : "stdio_copy");
+}
+ 
+/* ─────────────────────────────────────────────────────────
+ * print_help() — muestra cómo usar el programa
+ * ───────────────────────────────────────────────────────── */
+static void
+print_help(const char *prog)
+{
+    printf("\n" 
+           "  Sistema de Backup — Syscalls vs stdio\n");
+    printf("\n  Uso:\n");
+    printf("    %s -b <origen> <destino>   respalda un archivo\n",
+           prog);
+    printf("    %s --benchmark             tabla 1KB · 1MB · 1GB\n",
+           prog);
+    printf("    %s -h                      esta ayuda\n\n", prog);
+    printf("  Ejemplos:\n");
+    printf("    %s -b /etc/hosts /tmp/hosts_copia\n", prog);
+    printf("    %s --benchmark\n\n", prog);
+}
+ 
+/* ─────────────────────────────────────────────────────────
+ * main() — FINAL
+ *
+ * Flujo de decisiones:
+ *   argc < 2        → print_help()
+ *   argv[1] == -h   → print_help()
+ *   argv[1] == -b   → run_backup(argv[2], argv[3])
+ *   argv[1] == --benchmark → run_benchmark()
+ *   otro            → error + print_help()
+ *
+ * strcmp() retorna 0 cuando dos strings son iguales.
+ * argc == 4 verifica que haya exactamente: prog -b src dst
+ * ───────────────────────────────────────────────────────── */
 int
 main(int argc, char *argv[])
 {
-    /* Crear un archivo de prueba pequeño */
-    FILE *f = fopen("/tmp/prueba_paso3.txt", "wb");
-    if (f) {
-        fprintf(f, "Hola desde el paso 3\n");
-        fclose(f);
+    /* Sin argumentos → mostrar ayuda */
+    if (argc < 2) {
+        print_help(argv[0]);
+        return EXIT_FAILURE;
     }
  
-    printf("\n=== Probando apertura de archivos ===\n\n");
+    /* -h o --help */
+    if (strcmp(argv[1], "-h") == 0 ||
+        strcmp(argv[1], "--help") == 0) {
+        print_help(argv[0]);
+        return EXIT_SUCCESS;
+    }
  
-    /* Prueba 1: archivo que existe */
-    printf("Prueba 1 — archivo válido:\n");
-    sc_result_t r1;
-    sys_smart_copy("/tmp/prueba_paso3.txt",
-                   "/tmp/prueba_dst_smart.txt", &r1);
-    stdio_copy("/tmp/prueba_paso3.txt",
-               "/tmp/prueba_dst_stdio.txt", &r1);
+    /* --benchmark */
+    if (strcmp(argv[1], "--benchmark") == 0) {
+        run_benchmark();
+        return EXIT_SUCCESS;
+    }
  
-    /* Prueba 2: archivo que NO existe */
-    printf("\nPrueba 2 — archivo inexistente:\n");
-    sc_result_t r2;
-    sys_smart_copy("/tmp/no_existe.txt",
-                   "/tmp/dst.txt", &r2);
-    stdio_copy("/tmp/no_existe.txt",
-               "/tmp/dst.txt", &r2);
+    /* -b o --backup */
+    if (strcmp(argv[1], "-b") == 0 ||
+        strcmp(argv[1], "--backup") == 0) {
  
-    /* Prueba 3: sin permisos */
-    printf("\nPrueba 3 — sin permisos (solo en Linux):\n");
-    system("touch /tmp/sin_permisos.txt && "
-           "chmod 000 /tmp/sin_permisos.txt");
-    sc_result_t r3;
-    sys_smart_copy("/tmp/sin_permisos.txt",
-                   "/tmp/dst.txt", &r3);
+        /* Verificar que vienen los dos argumentos */
+        if (argc != 4) {
+            fprintf(stderr,
+                "[ERROR] Uso: %s -b <origen> <destino>\n",
+                argv[0]);
+            return EXIT_FAILURE;
+        }
  
-    /* Limpieza */
-    unlink("/tmp/prueba_paso3.txt");
-    unlink("/tmp/prueba_dst_smart.txt");
-    unlink("/tmp/prueba_dst_stdio.txt");
-    unlink("/tmp/sin_permisos.txt");
+        run_backup(argv[2], argv[3]);
+        return EXIT_SUCCESS;
+    }
  
-    printf("\nPaso 3 completo\n");
-    return EXIT_SUCCESS;
+    /* Opción no reconocida */
+    fprintf(stderr,
+        "[ERROR] Opción no reconocida: '%s'\n", argv[1]);
+    print_help(argv[0]);
+    return EXIT_FAILURE;
 }
  
