@@ -392,6 +392,26 @@ run_backup(const char *src, const char *dst)
 
     printf("\n--- Respaldando '%s' ---\n\n", src);
 
+
+    /*
+     * Verificar si el archivo fue modificado desde el último backup.
+     * Si no fue modificado → mostrar warning y pedir confirmación.
+     * El usuario puede cancelar o continuar de todos modos.
+     */
+    if (log_check_modified(src) == 0) {
+        printf("[WARNING] El archivo '%s' no fue modificado\n", src);
+        printf("          desde el último backup registrado.\n");
+        printf("          ¿Deseas hacer el backup de todos modos? [s/N]: ");
+        fflush(stdout);
+ 
+        char respuesta = getchar();
+        if (respuesta != 's' && respuesta != 'S') {
+            printf("[INFO] Backup cancelado.\n\n");
+            return;
+        }
+        printf("\n");
+    }
+ 
     /*
      * Generamos dos destinos con sufijo en output/:
      *   ./backup -b /etc/hosts copia

@@ -253,6 +253,83 @@ log_check(const char *src_path)
 }
  
 
+
+/* ─────────────────────────────────────────────────────────
+ * log_check_modified() — verifica si el archivo fue modificado
+ * desde el último backup
+ *
+ * CÓMO FUNCIONA:
+ *   1. stat(src_path) → obtiene mtime (fecha última modificación)
+ *   2. Lee backup.log buscando la última entrada de src_path
+ *   3. Convierte el timestamp del log a time_t
+ *   4. Si mtime <= fecha_ultimo_backup → no fue modificado
+ *
+ * @return  1 si fue modificado o sin backup previo (proceder)
+ *          0 si NO fue modificado desde el último backup (warning)
+ * ───────────────────────────────────────────────────────── */
+
+int
+log_check_modified(const char *src_path)
+{
+    /* Obtener fecha de modificación del archivo */
+    struct stat st;
+    if (stat(src_path, &st) != 0)
+        return 1; /* no se puede leer → proceder igual */
+ 
+    time_t file_mtime = st.st_mtime;
+ 
+    /* Abrir el log */
+    FILE *log = fopen(LOG_PATH, "r");
+    if (!log)
+        return 1; /* sin log = nunca tuvo backup → proceder */
+ 
+    /*
+     * Leer todas las líneas y guardar el timestamp
+     * de la ÚLTIMA entrada que coincida con src_path.
+     */
+    char line[512];
+    char last_timestamp[32] = "";
+ 
+    while (fgets(line, sizeof(line), log)) {
+        if (strstr(line, src_path) == NULL)
+            continue;
+        /* Extraer timestamp entre [ y ] */
+        char *ts_start = strchr(line, '[');
+        char *ts_end   = strchr(line, ']');
+        if (ts_start && ts_end && ts_end > ts_start) {
+            int len = (int)(ts_end - ts_start - 1);
+            if (len > 0 && len < (int)sizeof(last_timestamp)) {
+                strncpy(last_timestamp, ts_start + 1, (size_t)len);
+                last_timestamp[len] = '\0';
+            }
+        }
+    }
+    fclose(log);
+ 
+    /* Sin entradas → nunca tuvo backup */
+    if (last_timestamp[0] == '\0')
+        return 1;
+ 
+    /*
+     * Convertir timestamp del log a time_t.
+     * Formato: "2024-11-15 10:32:45"
+     */
+    struct tm tm_backup;
+    memset(&tm_backup, 0, sizeof(tm_backup));
+    strptime(last_timestamp, "%Y-%m-%d %H:%M:%S", &tm_backup);
+    time_t backup_time = mktime(&tm_backup);
+ 
+    /*
+     * Comparar fechas:
+     *   file_mtime > backup_time → modificado después del backup
+     *   file_mtime <= backup_time → NO modificado desde el backup
+     */
+    if (file_mtime <= backup_time)
+        return 0; /* warning: no fue modificado */
+ 
+    return 1; /* fue modificado → proceder */
+}
+ 
 /* sys_smart_copy() — pseudofunción de sistema*/
 
 int

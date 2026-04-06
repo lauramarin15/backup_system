@@ -56,8 +56,9 @@ void log_write(const char *method,
                const char *dst,
                const sc_result_t *result);
  
-
-
 /* log_check() — verifica si un archivo ya tuvo backup */         
 int log_check(const char *src_path);
+
+/*log_check_modified() — verifica si el archivo fue modificado desde el último backup.*/
+int log_check_modified(const char *src_path);
 #endif 
