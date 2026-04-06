@@ -83,6 +83,8 @@ handle_open_error(const char *path, int is_src)
 }
 
 
+/* sys_smart_copy() — pseudofunción de sistema*/
+
 int
 sys_smart_copy(const char *src_path,
                const char *dst_path,
@@ -112,6 +114,7 @@ sys_smart_copy(const char *src_path,
     uint32_t read_ops     = 0;  /* veces que llamamos read()      */
     uint32_t write_ops    = 0;  /* veces que llamamos write()     */
 
+    /* tiempo */
     struct timespec t_start, t_end;
  
   /* ── 1. Inicializar syslog ───────────────────────────
@@ -169,14 +172,14 @@ sys_smart_copy(const char *src_path,
         goto cleanup;
     }
  
-    /* CLOCK_MONOTONIC = reloj que nunca retrocede,
+    /* tiempo
+    * CLOCK_MONOTONIC = reloj que nunca retrocede,
      * aunque el usuario cambie la hora del sistema.
      */
     clock_gettime(CLOCK_MONOTONIC, &t_start);
  
     
     /*
-     *
      * El externo itera sobre los chunks del archivo.
      * El interno maneja short-writes — write() puede
      * escribir MENOS bytes de los pedidos sin ser error.
@@ -271,17 +274,8 @@ sys_smart_copy(const char *src_path,
         goto cleanup;
     }
  
-    /* Llegamos aquí solo si todo salió bien */
-    printf("[OK] sys_smart_copy: %lld bytes copiados\n",
-           (long long)bytes_copied);
     syslog(LOG_INFO, "Copia exitosa: %lld bytes",
            (long long)bytes_copied);
- 
-
-    /* Éxito provisional */
-    syslog(LOG_INFO, "Archivos abiertos correctamente.");
-    printf("[OK] Archivos abiertos: src_fd=%d  dst_fd=%d\n",
-           src_fd, dst_fd);
 
 /* Esto garantiza que SIEMPRE cerramos los descriptores,
  * aunque haya habido un error a mitad del proceso.
