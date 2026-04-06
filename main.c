@@ -193,6 +193,9 @@ cleanup:
             : 0.0;
     }
 
+    if (result)
+        log_write("stdio", src_path, dst_path, result);
+
     return rc;
 }
 
@@ -309,7 +312,7 @@ run_benchmark(void)
     for (int i = 0; i < n; i++) {
 
         /* Paso 1: generar archivo de prueba */
-        printf("  Generando %s...\r", tests[i].label);
+        printf("  Generando %s...\n", tests[i].label);
         fflush(stdout);
 
         if (generate_file(TMP_SRC, tests[i].size) != 0) {
@@ -442,6 +445,8 @@ print_help(const char *prog)
     printf("    %s -b /etc/hosts copia_hosts\n", prog);
     printf("    %s --benchmark\n\n", prog);
     printf("  Los archivos se guardan en output/\n\n");
+    printf("    %s --check <archivo>       ver historial de backups\n", prog);
+
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -470,6 +475,17 @@ main(int argc, char *argv[])
     if (strcmp(argv[1], "-h") == 0 ||
         strcmp(argv[1], "--help") == 0) {
         print_help(argv[0]);
+        return EXIT_SUCCESS;
+    }
+
+    /* --check → verificar si un archivo ya tuvo backup */
+    if (strcmp(argv[1], "--check") == 0) {
+        if (argc != 3) {
+            fprintf(stderr,
+                "[ERROR] Uso: %s --check <archivo>\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+        log_check(argv[2]);
         return EXIT_SUCCESS;
     }
 

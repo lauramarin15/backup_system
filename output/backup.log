@@ -1,0 +1,8 @@
+[2026-04-05 21:07:05] syscall | output/bk_src.bin → output/bk_dst_smart.bin | 1024 bytes | 0.000092s | 10.61 MB/s | OK
+[2026-04-05 21:07:05] stdio   | output/bk_src.bin → output/bk_dst_stdio.bin | 1024 bytes | 0.000083s | 11.77 MB/s | OK
+[2026-04-05 21:07:05] syscall | output/bk_src.bin → output/bk_dst_smart.bin | 1048576 bytes | 0.001982s | 504.54 MB/s | OK
+[2026-04-05 21:07:05] stdio   | output/bk_src.bin → output/bk_dst_stdio.bin | 1048576 bytes | 0.001666s | 600.24 MB/s | OK
+[2026-04-05 21:07:15] syscall | output/bk_src.bin → output/bk_dst_smart.bin | 1073741824 bytes | 1.589108s | 644.39 MB/s | OK
+[2026-04-05 21:07:16] stdio   | output/bk_src.bin → output/bk_dst_stdio.bin | 1073741824 bytes | 1.588342s | 644.70 MB/s | OK
+[2026-04-05 21:09:05] syscall | /etc/hosts → output/copia_hosts.smart | 213 bytes | 0.000369s | 0.55 MB/s | OK
+[2026-04-05 21:09:05] stdio   | /etc/hosts → output/copia_hosts.stdio | 213 bytes | 0.000243s | 0.84 MB/s | OK

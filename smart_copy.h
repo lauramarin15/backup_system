@@ -7,7 +7,7 @@
 
 #define PAGE_SIZE   4096          /* 1 página = 4 KiB               */
 #define IO_BLOCK    (PAGE_SIZE * 16)  /* buffer real = 64 KiB       */
- 
+#define LOG_PATH    "output/backup.log"
 /* ─────────────────────────────────────────────────────────
  * CÓDIGOS DE ERROR
  * 9 tipos de fallo posibles
@@ -42,6 +42,22 @@ int         sys_smart_copy(const char *src_path,
 const char *sc_strerror(int err_code);
 void        sc_print_result(const char *label,
                             const sc_result_t *result);
+
+
+/*
+ * log_write() — escribe una línea en output/backup.log
+ *
+ * Registra cada operación de copia con:
+ *   fecha/hora, método, origen, destino, bytes, tiempo, estado
+ */
+
+void log_write(const char *method,
+               const char *src,
+               const char *dst,
+               const sc_result_t *result);
  
-                            
+
+
+/* log_check() — verifica si un archivo ya tuvo backup */         
+int log_check(const char *src_path);
 #endif 

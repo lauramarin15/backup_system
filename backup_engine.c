@@ -83,6 +83,176 @@ handle_open_error(const char *path, int is_src)
 }
 
 
+
+/* ─────────────────────────────────────────────────────────
+ * log_write() — escribe una línea en output/backup.log
+ *
+ * Formato de cada línea:
+ *   [2024-11-15 10:32:45] syscall | origen → destino | 1048576 bytes | 0.003100s | 321.42 MB/s | OK
+ *
+ * Abre el archivo en modo "a" (append) para no borrar
+ * entradas anteriores — cada copia agrega una línea nueva.
+ *
+ * Si la carpeta output/ no existe, intenta crearla.
+ * ───────────────────────────────────────────────────────── */
+void
+log_write(const char *method,
+          const char *src,
+          const char *dst,
+          const sc_result_t *result)
+{
+    if (!result) return;
+ 
+    /* Crear output/ si no existe */
+    mkdir("output", 0755);
+ 
+    /* Abrir log en modo append — agrega al final sin borrar */
+    FILE *log = fopen(LOG_PATH, "a");
+    if (!log) return; /* si no se puede abrir, continuar sin log */
+ 
+    /* Obtener fecha y hora actual */
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
+ 
+    /* Escribir línea de log */
+    fprintf(log,
+        "[%s] %-7s | %s → %s | %lld bytes | %.6fs | %.2f MB/s | %s\n",
+        timestamp,
+        method,
+        src,
+        dst,
+        (long long)result->bytes_copied,
+        result->elapsed_sec,
+        result->throughput_mbps,
+        result->status == SC_OK ? "OK" : sc_strerror(result->status));
+ 
+    fclose(log);
+}
+ 
+/* ─────────────────────────────────────────────────────────
+ * log_check() — verifica si un archivo ya tuvo backup
+ *
+ * Lee output/backup.log línea por línea buscando src_path.
+ * Si lo encuentra imprime cada entrada con su historial.
+ *
+ * Formato de búsqueda — cada línea del log tiene esta forma:
+ *   [2024-11-15 10:32:45] syscall | /etc/hosts → dst | ...
+ *   El origen está entre "| " y " →"
+ *
+ * @param src_path  ruta del archivo a consultar
+ * @return          1 si tiene al menos un backup, 0 si no
+ * ───────────────────────────────────────────────────────── */
+int
+log_check(const char *src_path)
+{
+    FILE *log = fopen(LOG_PATH, "r");
+    if (!log) {
+        /* El log no existe todavía — nunca se hizo un backup */
+        printf("[INFO] No existe historial de backups todavía.\n");
+        printf("       Ejecuta './backup -b %s <destino>' primero.\n",
+               src_path);
+        return 0;
+    }
+ 
+    char    line[512];
+    int     found    = 0;
+    int     count    = 0;
+ 
+    printf("\n  Historial de backups para: %s\n", src_path);
+    printf("  %-19s  %-7s  %-30s  %-8s  %s\n",
+           "Fecha/hora", "Método", "Destino", "Bytes", "Estado");
+    printf("  %-19s  %-7s  %-30s  %-8s  %s\n",
+           "───────────────────", "───────",
+           "──────────────────────────────", "────────", "──────");
+ 
+    /*
+     * Leer el log línea por línea.
+     * strstr() busca src_path como substring de cada línea.
+     * Si lo encuentra, parsea y muestra los campos relevantes.
+     */
+    while (fgets(line, sizeof(line), log)) {
+ 
+        /* Verificar si esta línea contiene el archivo buscado */
+        if (strstr(line, src_path) == NULL)
+            continue;
+ 
+        found = 1;
+        count++;
+ 
+        /*
+         * Parsear la línea para extraer campos.
+         * Formato: [timestamp] metodo | src → dst | bytes bytes | tiempo | throughput | estado
+         *
+         * Usamos sscanf con %*s para saltar campos que no necesitamos.
+         */
+        char timestamp[32]  = "";
+        char method[16]     = "";
+        char dst[256]       = "";
+        long long bytes     = 0;
+        char estado[32]     = "";
+ 
+        /* Extraer timestamp — está entre [ y ] */
+        char *ts_start = strchr(line, '[');
+        char *ts_end   = strchr(line, ']');
+        if (ts_start && ts_end && ts_end > ts_start) {
+            int len = (int)(ts_end - ts_start - 1);
+            if (len > 0 && len < (int)sizeof(timestamp)) {
+                strncpy(timestamp, ts_start + 1, (size_t)len);
+                timestamp[len] = '\0';
+            }
+        }
+ 
+        /* Extraer método — primer token después de "] " */
+        char *after_bracket = ts_end ? ts_end + 2 : line;
+        sscanf(after_bracket, "%15s", method);
+ 
+        /* Extraer destino — está entre "→ " y " |" */
+        char *arrow = strstr(line, "→ ");
+        if (arrow) {
+            char *pipe = strstr(arrow, " |");
+            if (pipe) {
+                int len = (int)(pipe - arrow - 2);
+                if (len > 0 && len < (int)sizeof(dst)) {
+                    strncpy(dst, arrow + 2, (size_t)len);
+                    dst[len] = '\0';
+                }
+            }
+        }
+ 
+        /* Extraer bytes */
+        char *bytes_ptr = strstr(line, "| ");
+        if (bytes_ptr) bytes_ptr = strstr(bytes_ptr + 2, "| ");
+        if (bytes_ptr) sscanf(bytes_ptr + 2, "%lld", &bytes);
+ 
+        /* Extraer estado — último campo de la línea */
+        char *last_pipe = strrchr(line, '|');
+        if (last_pipe) {
+            sscanf(last_pipe + 2, "%31s", estado);
+            /* quitar \n si lo hay */
+            char *nl = strchr(estado, '\n');
+            if (nl) *nl = '\0';
+        }
+ 
+        printf("  %-19s  %-7s  %-30s  %-8lld  %s\n",
+               timestamp, method, dst, bytes, estado);
+    }
+ 
+    fclose(log);
+ 
+    if (!found) {
+        printf("  (sin registros para este archivo)\n");
+        printf("\n  Nunca se hizo backup de '%s'\n\n", src_path);
+        return 0;
+    }
+ 
+    printf("\n  Total: %d backup(s) encontrado(s) para '%s'\n\n",
+           count, src_path);
+    return 1;
+}
+ 
+
 /* sys_smart_copy() — pseudofunción de sistema*/
 
 int
@@ -305,7 +475,10 @@ cleanup:
               / (1024.0 * 1024.0)
             : 0.0;
     }
- 
+
+    if (result)
+        log_write("syscall", src_path, dst_path, result);
+
     return rc;
 }
 
